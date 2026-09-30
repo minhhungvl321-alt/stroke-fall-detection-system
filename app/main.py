@@ -1,267 +1,335 @@
 import argparse
-import os
 import time
+from collections import deque
+
 import cv2
 import numpy as np
 from ultralytics import YOLO
-import mediapipe as mp
 
 from config import (
-    YOLO_MODEL,
+    CAMERA_INDEX,
     CONFIDENCE_THRESHOLD,
+    DEBUG_MODE,
     PERSON_CLASS_ID,
-    POSE_CONFIDENCE,
-    POSE_TRACKING_CONFIDENCE,
+    VIDEO_PATH,
+    YOLO_MODEL,
     FRAME_WIDTH,
     FRAME_HEIGHT,
-    CAMERA_INDEX,
-    VIDEO_PATH,
-    DEBUG_MODE,
-    SAVE_LOGS,
+    ALERT_COOLDOWN_SECONDS,
 )
+from utils.pose_analyzer import PoseAnalyzer
+from utils.motion_analyzer import MotionAnalyzer
+from utils.fall_detector import FallDetector
+from utils.alert_system import AlertSystem
 
 
-mp_pose = mp.solutions.pose
-pose = mp_pose.Pose(
-    static_image_mode=False,
-    model_complexity=1,
-    smooth_landmarks=True,
-    min_detection_confidence=POSE_CONFIDENCE,
-    min_tracking_confidence=POSE_TRACKING_CONFIDENCE,
-)
-
-def extract_pose_landmarks(frame):
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = pose.process(rgb)
-    if results.pose_landmarks is None:
-        return None
-
-    h, w, _ = frame.shape
-    landmarks = []
-    for lm in results.pose_landmarks.landmark:
-        x, y, z = lm.x, lm.y, lm.z
-        px = int(x * w)
-        py = int(y * h)
-        landmarks.append((px, py, z))
-    return landmarks
-
-
-def draw_landmarks(frame, landmarks):
-    if not landmarks:
-        return frame
-
-    connections = [
-        (0, 1), (1, 2), (2, 3), (3, 7),
-        (0, 4), (4, 5), (5, 6), (6, 8),
-        (9, 10), (11, 12), (11, 13), (13, 15),
-        (12, 14), (14, 16), (11, 23), (12, 24),
-        (23, 24), (23, 25), (25, 27), (24, 26),
-        (27, 28), (28, 29), (29, 30), (26, 31),
-        (31, 32), (32, 33), (27, 31), (24, 32)
-    ]
-    for p1, p2 in connections:
-        if p1 < len(landmarks) and p2 < len(landmarks):
-            x1, y1, _ = landmarks[p1]
-            x2, y2, _ = landmarks[p2]
-            cv2.line(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-    for idx, (x, y, _) in enumerate(landmarks):
-        if idx in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33]:
-            cv2.circle(frame, (x, y), 4, (0, 0, 255), -1)
-    return frame
-
-
-def compute_pose_features(landmarks):
-    if len(landmarks) < 33:
-        return {
-            "valid": False,
-            "face_asymmetry": 0.0,
-            "arm_asymmetry": 0.0,
-            "body_tilt": 0.0,
-            "walking_unstable": 0.0,
-            "fall_score": 0.0,
-            "risk_score": 0.0,
-        }
-
-    nose = landmarks[0]
-    left_ear = landmarks[7]
-    right_ear = landmarks[8]
-    left_shoulder = landmarks[11]
-    right_shoulder = landmarks[12]
-    left_hip = landmarks[23]
-    right_hip = landmarks[24]
-    left_knee = landmarks[25]
-    right_knee = landmarks[26]
-    left_ankle = landmarks[27]
-    right_ankle = landmarks[28]
-    left_wrist = landmarks[15]
-    right_wrist = landmarks[16]
-
-    def euclidean(a, b):
-        return np.linalg.norm(np.array(a[:2]) - np.array(b[:2]))
-
-    face_width = euclidean(left_ear, right_ear)
-    face_mid = ((left_ear[0] + right_ear[0]) / 2, (left_ear[1] + right_ear[1]) / 2)
-    left_eye = landmarks[1]
-    right_eye = landmarks[2]
-    eye_left_dist = abs(left_eye[0] - face_mid[0])
-    eye_right_dist = abs(right_eye[0] - face_mid[0])
-    face_asymmetry = abs(eye_left_dist - eye_right_dist) / max(face_width, 1)
-
-    left_arm = euclidean(left_shoulder, left_wrist)
-    right_arm = euclidean(right_shoulder, right_wrist)
-    arm_asymmetry = abs(left_arm - right_arm) / max(left_arm + right_arm, 1)
-
-    body_height = euclidean(left_hip, nose)
-    body_width = euclidean(left_shoulder, right_shoulder)
-    aspect_ratio = body_width / max(body_height, 1)
-
-    left_hip_y = left_hip[1]
-    right_hip_y = right_hip[1]
-    shoulder_y = (left_shoulder[1] + right_shoulder[1]) / 2
-    body_tilt = abs(shoulder_y - ((left_hip_y + right_hip_y) / 2))
-
-    left_leg = euclidean(left_hip, left_ankle)
-    right_leg = euclidean(right_hip, right_ankle)
-    gait = abs(left_leg - right_leg) / max(left_leg + right_leg, 1)
-
-    fall_score = 0.0
-    if aspect_ratio < 0.6:
-        fall_score += 0.45
-    if body_tilt > 40:
-        fall_score += 0.25
-    if abs(left_hip_y - right_hip_y) > 20:
-        fall_score += 0.15
-    if abs(nose[1] - ((left_hip_y + right_hip_y) / 2)) > 60:
-        fall_score += 0.15
-
-    risk_score = min(1.0, fall_score + 0.4 * face_asymmetry + 0.4 * arm_asymmetry + 0.3 * gait)
-
-    return {
-        "valid": True,
-        "face_asymmetry": float(face_asymmetry),
-        "arm_asymmetry": float(arm_asymmetry),
-        "body_tilt": float(body_tilt),
-        "walking_unstable": float(gait),
-        "fall_score": float(fall_score),
-        "risk_score": float(risk_score),
-    }
-
-
-def detect_person(frame, model):
-    results = model(frame, verbose=False)
-    boxes = results[0].boxes
-    detections = []
-    if boxes is not None:
-        for box in boxes:
-            cls_id = int(box.cls[0].item())
-            if cls_id != PERSON_CLASS_ID:
-                continue
-            conf = float(box.conf[0].item())
-            if conf < CONFIDENCE_THRESHOLD:
-                continue
-            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-            detections.append({
-                "bbox": (x1, y1, x2, y2),
-                "confidence": conf,
-            })
-    return detections
-
-
-def annotate_frame(frame, person_detection, features, status_text, alert_level):
-    if person_detection:
-        x1, y1, x2, y2 = person_detection[0]["bbox"]
-        color = (0, 255, 0)
+class FallDetectionSystem:
+    """
+    Integrated system for fall and abnormal movement detection
+    
+    Architecture:
+        Camera -> YOLO Detection -> MediaPipe Pose -> Motion Analysis -> Fall Detection -> Alert
+    """
+    
+    def __init__(self, video_source=None):
+        print("[*] Initializing Fall Detection System...")
+        
+        # Load models
+        print("[*] Loading YOLO model...")
+        self.model = YOLO(YOLO_MODEL)
+        
+        # Initialize analyzers
+        self.pose_analyzer = PoseAnalyzer()
+        self.motion_analyzer = MotionAnalyzer()
+        self.fall_detector = FallDetector()
+        self.alert_system = AlertSystem()
+        
+        # Video source
+        self.video_source = video_source
+        self.cap = None
+        
+        # History tracking
+        self.center_history = deque(maxlen=30)
+        self.area_history = deque(maxlen=30)
+        self.velocity_history = deque(maxlen=10)
+        
+        print("[*] System initialized successfully!")
+    
+    def start_capture(self):
+        """Initialize video capture"""
+        source = self.video_source if self.video_source else CAMERA_INDEX
+        self.cap = cv2.VideoCapture(source)
+        
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Cannot open video source: {source}")
+        
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+        print(f"[+] Video capture started from source: {source}")
+    
+    def detect_persons(self, frame):
+        """
+        Detect persons using YOLO
+        
+        Returns:
+            list: List of detected persons with bbox and center
+        """
+        results = self.model.track(frame, persist=True, verbose=False)
+        persons = []
+        
+        if results and results[0].boxes is not None:
+            for box in results[0].boxes:
+                cls_id = int(box.cls[0].item())
+                if cls_id != PERSON_CLASS_ID:
+                    continue
+                
+                conf = float(box.conf[0].item())
+                if conf < CONFIDENCE_THRESHOLD:
+                    continue
+                
+                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                center = ((x1 + x2) // 2, (y1 + y2) // 2)
+                area = (x2 - x1) * (y2 - y1)
+                
+                persons.append({
+                    "bbox": (x1, y1, x2, y2),
+                    "center": center,
+                    "area": area,
+                    "confidence": conf,
+                })
+        
+        return persons
+    
+    def update_motion_history(self, center, area):
+        """
+        Update center and area history, calculate velocity
+        """
+        motion = {"center_velocity": 0.0, "area_change_rate": 0.0}
+        
+        # Calculate center velocity
+        if len(self.center_history) > 0:
+            prev_center = self.center_history[-1]
+            motion["center_velocity"] = self.motion_analyzer.calculate_velocity(
+                prev_center, center
+            )
+        
+        # Calculate area change rate
+        if len(self.area_history) > 0:
+            prev_area = self.area_history[-1]
+            motion["area_change_rate"] = self.motion_analyzer.calculate_area_change(
+                prev_area, area
+            )
+        
+        # Update history
+        self.center_history.append(center)
+        self.area_history.append(area)
+        self.velocity_history.append(motion["center_velocity"])
+        
+        return motion
+    
+    def classify_alert_level(self, status):
+        """
+        Classify alert level based on status
+        """
+        if "FALLEN" in status or "ALERT" in status:
+            return "high"
+        elif "FALLING" in status or "ABNORMAL" in status:
+            return "medium"
+        elif "NORMAL" in status:
+            return "normal"
+        else:
+            return "low"
+    
+    def draw_visualization(self, frame, persons, features, motion, status, alert_level):
+        """
+        Draw bounding box, skeleton, metrics on frame
+        """
+        if not persons:
+            cv2.putText(
+                frame,
+                "NO PERSON DETECTED",
+                (20, 50),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 0, 255),
+                2,
+            )
+            return frame
+        
+        # Get main person (first detected)
+        person = persons[0]
+        x1, y1, x2, y2 = person["bbox"]
+        
+        # Draw bounding box with color based on alert level
         if alert_level == "high":
-            color = (0, 0, 255)
+            color = (0, 0, 255)  # Red
         elif alert_level == "medium":
-            color = (0, 165, 255)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            color = (0, 165, 255)  # Orange
+        else:
+            color = (0, 255, 0)  # Green
+        
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+        
+        # Draw skeleton if landmarks available
+        landmarks = self.pose_analyzer.extract_landmarks(frame)
+        if landmarks:
+            frame = self.pose_analyzer.draw_landmarks(frame, landmarks)
+        
+        # Draw status
+        status_color = (0, 0, 255) if alert_level == "high" else (255, 255, 255)
+        cv2.putText(
+            frame,
+            f"Status: {status}",
+            (20, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.9,
+            status_color,
+            2,
+        )
+        
+        # Draw metrics
+        y_offset = 80
+        metrics = [
+            f"Face asymmetry: {features.get('face_asymmetry', 0.0):.2f}",
+            f"Arm asymmetry: {features.get('arm_asymmetry', 0.0):.2f}",
+            f"Body tilt: {features.get('body_tilt', 0.0):.1f}px",
+            f"Unstable gait: {features.get('walking_unstable', 0.0):.2f}",
+            f"Center velocity: {motion.get('center_velocity', 0.0):.1f}px",
+            f"Area change: {motion.get('area_change_rate', 0.0):.2f}",
+            f"Risk Score: {features.get('risk_score', 0.0):.2f}",
+        ]
+        
+        for metric in metrics:
+            cv2.putText(
+                frame,
+                metric,
+                (20, y_offset),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 255),
+                1,
+            )
+            y_offset += 28
+        
+        return frame
+    
+    def run(self):
+        """
+        Main detection loop
+        """
+        self.start_capture()
+        print("[*] Starting detection loop... (Press 'q' to quit)")
+        
+        frame_count = 0
+        fps_start = time.time()
+        
+        while True:
+            ret, frame = self.cap.read()
+            if not ret:
+                print("[!] End of video stream")
+                break
+            
+            frame_count += 1
+            
+            # Step 1: YOLO Detection
+            persons = self.detect_persons(frame)
+            
+            if not persons:
+                cv2.putText(
+                    frame,
+                    "NO PERSON DETECTED",
+                    (20, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 0, 255),
+                    2,
+                )
+                cv2.imshow("Fall & Abnormal Movement Detection", frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+                continue
+            
+            # Step 2: Extract pose landmarks
+            landmarks = self.pose_analyzer.extract_landmarks(frame)
+            features = (
+                self.pose_analyzer.calculate_features(landmarks)
+                if landmarks
+                else {
+                    "valid": False,
+                    "face_asymmetry": 0.0,
+                    "arm_asymmetry": 0.0,
+                    "body_tilt": 0.0,
+                    "walking_unstable": 0.0,
+                    "body_aspect_ratio": 1.0,
+                    "fall_score": 0.0,
+                    "risk_score": 0.0,
+                }
+            )
+            
+            # Step 3: Motion analysis
+            person = persons[0]
+            motion = self.update_motion_history(person["center"], person["area"])
+            
+            # Step 4: Fall detection
+            result = self.fall_detector.detect_fall(features, motion)
+            status = result["status"]
+            alert_level = result["alert_level"]
+            risk_score = result["risk_score"]
+            
+            # Step 5: Alert triggering
+            if alert_level in ["high", "medium"]:
+                if self.alert_system.should_alert(alert_level, ALERT_COOLDOWN_SECONDS):
+                    self.alert_system.log_alert(status, risk_score)
+            
+            # Step 6: Visualization
+            frame = self.draw_visualization(
+                frame, persons, features, motion, status, alert_level
+            )
+            
+            # Calculate and display FPS
+            if frame_count % 30 == 0:
+                elapsed = time.time() - fps_start
+                fps = 30 / elapsed
+                print(f"[*] FPS: {fps:.2f}")
+                fps_start = time.time()
+            
+            cv2.imshow("Fall & Abnormal Movement Detection", frame)
+            
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                print("[*] Exiting...")
+                break
+        
+        self.cap.release()
+        cv2.destroyAllWindows()
+        print("[+] Detection system stopped")
 
-    label = f"Status: {status_text}"
-    cv2.putText(frame, label, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
-    if features["valid"]:
-        cv2.putText(frame, f"Face asym: {features['face_asymmetry']:.2f}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(frame, f"Arm asym: {features['arm_asymmetry']:.2f}", (20, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(frame, f"Risk: {features['risk_score']:.2f}", (20, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-    return frame
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Fall and Abnormal Movement Detection System"
+    )
+    parser.add_argument(
+        "--video", type=str, default=None, help="Path to video file (optional)"
+    )
+    parser.add_argument(
+        "--camera", type=int, default=CAMERA_INDEX, help="Camera index"
+    )
+    return parser.parse_args()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Fall and abnormal movement detection")
-    parser.add_argument("--video", type=str, default=VIDEO_PATH, help="Optional path to a video file")
-    parser.add_argument("--camera", type=int, default=CAMERA_INDEX, help="Camera index")
-    parser.add_argument("--debug", action="store_true", default=DEBUG_MODE)
-    args = parser.parse_args()
-
-    model = YOLO(YOLO_MODEL)
-
-    if args.video:
-        cap = cv2.VideoCapture(args.video)
-    else:
-        cap = cv2.VideoCapture(args.camera)
-
-    if not cap.isOpened():
-        print("Error: cannot open camera/video.")
-        return
-
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-
-    frame_counter = 0
-    alert_state = "normal"
-    last_alert_time = 0
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        frame_counter += 1
-        if frame_counter % 2 != 0:
-            pass
-
-        person_detections = detect_person(frame, model)
-        landmarks = extract_pose_landmarks(frame)
-        features = compute_pose_features(landmarks) if landmarks else {"valid": False, "face_asymmetry": 0.0, "arm_asymmetry": 0.0, "body_tilt": 0.0, "walking_unstable": 0.0, "fall_score": 0.0, "risk_score": 0.0}
-
-        if landmarks:
-            frame = draw_landmarks(frame, landmarks)
-
-        status = "normal"
-        if features["valid"]:
-            if features["risk_score"] > 0.7:
-                status = "alert"
-            elif features["fall_score"] > 0.35:
-                status = "warning"
-            elif features["face_asymmetry"] > 0.15 or features["arm_asymmetry"] > 0.25:
-                status = "abnormal"
-            elif features["walking_unstable"] > 0.15:
-                status = "unstable"
-
-        if status == "alert":
-            alert_state = "high"
-        elif status in ["warning", "abnormal", "unstable"]:
-            alert_state = "medium"
-        else:
-            alert_state = "normal"
-
-        frame = annotate_frame(frame, person_detections, features, status, alert_state)
-
-        if status != "normal" and time.time() - last_alert_time > 2.5:
-            print(f"ALERT: {status} risk={features['risk_score']:.2f}")
-            last_alert_time = time.time()
-
-        cv2.imshow("Fall & Abnormal Movement Detection", frame)
-
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
-            break
-
-    cap.release()
-    cv2.destroyAllWindows()
+    args = parse_args()
+    
+    try:
+        video_source = args.video if args.video else args.camera
+        system = FallDetectionSystem(video_source=video_source)
+        system.run()
+    except KeyboardInterrupt:
+        print("\n[*] Interrupted by user")
+    except Exception as e:
+        print(f"[!] Error: {e}")
+        raise
 
 
 if __name__ == "__main__":

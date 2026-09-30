@@ -2,44 +2,46 @@ import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
-MODELS_DIR = BASE_DIR / "models"
+MODEL_DIR = BASE_DIR / "models"
 OUTPUT_DIR = BASE_DIR / "output"
-LOGS_DIR = BASE_DIR / "logs"
+LOG_DIR = BASE_DIR / "logs"
 DATASET_DIR = BASE_DIR / "dataset"
 
-for d in [MODELS_DIR, OUTPUT_DIR, LOGS_DIR, DATASET_DIR]:
-    d.mkdir(exist_ok=True)
+for directory in [MODEL_DIR, OUTPUT_DIR, LOG_DIR, DATASET_DIR]:
+    directory.mkdir(exist_ok=True)
 
+# ========== YOLO Configuration ==========
 YOLO_MODEL = "yolov8n.pt"
 CONFIDENCE_THRESHOLD = 0.5
 PERSON_CLASS_ID = 0
 
+# ========== MediaPipe Pose Configuration ==========
 POSE_CONFIDENCE = 0.7
 POSE_TRACKING_CONFIDENCE = 0.5
 
-# fall thresholds
-FALL_ASPECT_RATIO_THRESHOLD = 0.6
-FALL_BODY_MIN_WIDTH_RATIO = 0.35
-FALL_LYING_TIME_THRESHOLD = 1.0
-FALL_IMMOBILE_THRESHOLD = 0.6
-FALL_CENTER_HEIGHT_DIFF = 0.3
+# ========== Fall Detection Thresholds ==========
+FALL_ASPECT_THRESHOLD = 0.60  # width/height ratio
+FALL_BODY_TILT_THRESHOLD = 40  # degrees
+FALL_MIN_FRAMES = 5  # frames to confirm fall
+FALL_STATIC_FRAMES = 30  # frames (approx 1 second at 30fps) to alert
+FALL_STATIC_VELOCITY = 5.0  # pixels/frame
 
-# abnormal movement thresholds
+# ========== Abnormal Movement Thresholds ==========
 FACE_ASYMMETRY_THRESHOLD = 0.15
 ARM_ASYMMETRY_THRESHOLD = 0.25
+WALKING_UNSTABLE_THRESHOLD = 0.15
 BODY_TILT_THRESHOLD = 25
-WALKING_UNSTABLE_THRESHOLD = 15
-ABNORMAL_RESP_THRESHOLD = 0.7
 
-RISK_ALERT_THRESHOLD = 0.7
+# ========== Alert Configuration ==========
+RISK_ALERT_THRESHOLD = 0.70
 ALERT_COOLDOWN_SECONDS = 2.5
-DEBUG_MODE = True
-SAVE_LOGS = True
-SAVE_VIDEO_ON_ALERT = True
 
+# ========== Video Configuration ==========
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 480
 CAMERA_INDEX = 0
 VIDEO_PATH = None
 
-FRAME_WIDTH = 640
-FRAME_HEIGHT = 480
-FPS = 30
+# ========== Debug Mode ==========
+DEBUG_MODE = True
+SAVE_LOGS = True
