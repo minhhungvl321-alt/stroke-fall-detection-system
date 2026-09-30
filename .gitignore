@@ -1,0 +1,40 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+env/
+ENV/
+
+# IDE settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Output and generated files
+output/
+results/
+
+# Models / weights downloaded at runtime
+models/*.pt
+models/*.weights
+
+# Video / datasets locally stored
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Temporary files
+*.tmp
